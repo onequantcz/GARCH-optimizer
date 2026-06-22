@@ -1,0 +1,1833 @@
+specs <- list( #all optimization starting points automatically initializing its own parameters
+  data =             y, #dependent variable
+  drift =            NULL, #1, NULL, drift parameter
+  start_ar =         c(0.2, 0.2), #numeric(0), AR parameters
+  start_ma =         numeric(0), #numeric(0), MA parameters
+  level_exog =       X_level, #matrix(nrow = 0, ncol = 0), #exogenes for level
+  start_level_exog = c(0.5), #numeric(0),
+  
+  omega =            2, #NULL is not an option mathematically
+  start_alpha =      c(0.2), #numeric(0), MA volatility parameter
+  start_beta =       c(0.5), #numeric(0), AR volatility parameter
+  var_exog =         X_var, #matrix(nrow = 0, ncol = 0), #exogenes for var
+  start_var_exog =   c(0.5), #numeric(0),
+  
+  start_df =         3, #freedom degrees for t
+  start_skew =       0.5, #skewness parameter for Hansen skewed-t
+  
+  fracdiff =         FALSE, #FALSE, TRUE, fractional differentiation
+  d =                0.4, #0, hyperparameter
+  
+  density =          "skewed-t", #norm, t, skewed-t
+  
+  method =           "GD", #GD, BFGS, SPSA
+  gradient =         "numeric", #analytic, numeric
+  
+  learning_rate =    1e-4, #starting parameters for GD, SPSA
+  convergence =      1e-4,
+  iterations =       1e5,
+  inert =            0.85, #Nesterov momentum inertion
+  eta_plus =         1.05, #adaptive learning rate parameters
+  eta_minus =        0.5,
+  eps =              1e-4, #constant for adaptive difference in SPSA
+  mean_last =        60 #how many last parameters is meaned in SPSA
+)
+
+GARCH_estimator <- function(specs) {
+  
+  data <- specs$data
+  X_level <- specs$level_exog
+  X_var <- specs$var_exog
+  warmup <- max(length(specs$start_ar), length(specs$start_ma), length(specs$start_alpha), length(specs$start_beta), 2)
+  
+  if (specs$fracdiff == TRUE) {
+    d <- specs$d
+    weights <- numeric(length(data))
+    weights[1] <- 1
+    for (i in 2:length(weights)) {
+      weights[i] <- weights[i-1] * (i - 1 - d) / i
+    }
+    for (i in seq_along(specs$data)) {
+      s <- numeric(i)
+      for(j in 1:i) {
+        s[j] <- specs$data[i - j + 1] * weights[j]
+      }
+      data[i] <- sum(s)
+    }
+  }
+  
+  if (specs$density == "t") {
+    
+    params <- list(drift = specs$drift, ar = specs$start_ar, ma = specs$start_ma, level_exog = specs$start_level_exog, 
+                   omega = specs$omega, alpha = specs$start_alpha, beta = specs$start_beta, 
+                   var_exog = specs$start_var_exog, df = specs$start_df)
+    
+    idx <- sapply(params, length)
+    
+    params_vector <- as.numeric(unlist(params))
+    
+    unpack <- function(params) {
+      out <- list()
+      pos <- 1
+      for (name in names(idx)) {
+        len <- idx[name]
+        if (len == 0) {
+          out[[name]] <- numeric(0)
+        } else {
+          out[[name]] <- params[pos:(pos+len-1)]
+        }
+        pos <- pos + len
+      }
+      return(out)
+    }
+    
+    reparametrization <- function(params) {
+      
+      params_re <- params
+      params_re$ar <- tanh(params$ar)
+      params_re$ma <- tanh(params$ma)
+      params_re$omega <- exp(params$omega)
+      
+      if (length(c(params$alpha, params$beta)) > 0) {
+        tmp <- exp(c(params$alpha, params$beta))
+        tmp <- tmp / (1 + sum(tmp))
+        
+        k <- length(params$alpha)
+        
+        params_re$alpha <- tmp[seq_len(k)]
+        
+        if (length(params$beta) > 0) {
+          params_re$beta <- tmp[(k+1):length(tmp)]
+        } else {
+          params_re$beta <- numeric(0)
+        }
+        
+      } else {
+        params_re$alpha <- numeric(0)
+        params_re$beta  <- numeric(0)
+      }
+      
+      params_re$df <- 2 + exp(params$df)
+      
+      return(params_re)
+    }
+    
+    log_likelihood <- function(params) {
+      
+      errors <- numeric(length(data))
+      vars <- numeric(length(data))
+      
+      if (sum(params$alpha) + sum(params$beta) >= 1) {
+        vars[1:warmup] <- var(data)
+      } else {
+        vars[1:warmup] <- params$omega / (1 - sum(params$alpha) - sum(params$beta))
+      }
+      
+      l <- numeric(length(data))
+      level <- numeric(length(data))
+      
+      for (i in seq_along(data)[-(1:warmup)]) {
+        
+        if (is.null(params$drift)) {
+          drift <- 0
+        } else {
+          drift <- params$drift
+        }
+        
+        ar <- params$ar
+        ma <- params$ma
+        level_exog <- params$level_exog
+        omega <- params$omega
+        alpha <- params$alpha
+        beta <- params$beta
+        var_exog <- params$var_exog
+        df <- params$df
+        
+        for (j in seq_along(ar)) {
+          ar[j] <- ar[j] * data[i - j]
+        }
+        
+        for (j in seq_along(ma)) {
+          ma[j] <- ma[j] * errors[i - j]
+        }
+        
+        for (j in seq_along(level_exog)) {
+          level_exog[j] <- level_exog[j] * X_level[i, j]
+        }
+        
+        for (j in seq_along(alpha)) {
+          alpha[j] <- alpha[j] * (errors[i - j])^2
+        }
+        
+        for (j in seq_along(beta)) {
+          beta[j] <- beta[j] * vars[i - j]
+        }
+        
+        for (j in seq_along(var_exog)) {
+          var_exog[j] <- var_exog[j] * X_var[i, j]
+        }
+        
+        level[i] <- sum(drift) + sum(ar) + sum(ma) + sum(level_exog)
+        
+        errors[i] <- data[i] - level[i]
+        
+        vars[i] <- omega + sum(alpha) + sum(beta) + sum(var_exog)
+        
+        z2 <- errors[i]^2
+        
+        l[i] <- lgamma((df + 1)/2) - lgamma(df/2) -
+          0.5 * log((df - 2) * pi * vars[i]) -
+          ((df + 1)/2) * log(1 + z2 / ((df - 2) * vars[i]))
+        
+      }
+      
+      log_likelihood <- sum(l[-(1:warmup)])
+      
+      return(log_likelihood)
+    }
+  }
+  
+  if (specs$density == "norm") {
+    
+    params <- list(drift = specs$drift, ar = specs$start_ar, ma = specs$start_ma, level_exog = specs$start_level_exog, 
+                   omega = specs$omega, alpha = specs$start_alpha, beta = specs$start_beta, 
+                   var_exog = specs$start_var_exog)
+    
+    idx <- sapply(params, length)
+    
+    params_vector <- as.numeric(unlist(params))
+    
+    unpack <- function(params) {
+      out <- list()
+      pos <- 1
+      for (name in names(idx)) {
+        len <- idx[name]
+        if (len == 0) {
+          out[[name]] <- numeric(0)
+        } else {
+          out[[name]] <- params[pos:(pos+len-1)]
+        }
+        pos <- pos + len
+      }
+      return(out)
+    }
+    
+    reparametrization <- function(params) {
+      
+      params_re <- params
+      params_re$ar <- tanh(params$ar)
+      params_re$ma <- tanh(params$ma)
+      params_re$omega <- exp(params$omega)
+      
+      if (length(c(params$alpha, params$beta)) > 0) {
+        tmp <- exp(c(params$alpha, params$beta))
+        tmp <- tmp / (1 + sum(tmp))
+        
+        k <- length(params$alpha)
+        
+        params_re$alpha <- tmp[seq_len(k)]
+        
+        if (length(params$beta) > 0) {
+          params_re$beta <- tmp[(k+1):length(tmp)]
+        } else {
+          params_re$beta <- numeric(0)
+        }
+        
+      } else {
+        params_re$alpha <- numeric(0)
+        params_re$beta  <- numeric(0)
+      }
+      return(params_re)
+    }
+    
+    #names <- names(unlist(params))
+    
+    log_likelihood <- function(params) {
+      
+      errors <- numeric(length(data))
+      vars <- numeric(length(data))
+      if (sum(params$alpha) + sum(params$beta) >= 1) {
+        vars[1:warmup] <- var(data)
+      } else {vars[1:warmup] <- params$omega / (1 - sum(params$alpha) - sum(params$beta))}
+      l <- numeric(length(data))
+      level <- numeric(length(data))
+      
+      for (i in seq_along(data)[-(1:warmup)]) {
+        
+        if (is.null(params$drift)) {
+          drift <- 0
+        } else {
+          drift <- params$drift
+        }
+        ar <- params$ar
+        ma <- params$ma
+        level_exog <- params$level_exog
+        omega <- params$omega
+        alpha <- params$alpha
+        beta <- params$beta
+        var_exog <- params$var_exog
+        
+        for (j in seq_along(ar)) {
+          ar[j] <- ar[j] * data[i - j]
+        }
+        
+        for (j in seq_along(ma)) {
+          ma[j] <- ma[j] * errors[i - j]
+        }
+        
+        for (j in seq_along(level_exog)) {
+          level_exog[j] <- level_exog[j] * X_level[i, j]
+        }
+        #if (length(level_exog) != ncol(X_level)) stop("Level exog dimension mismatch")
+        
+        for (j in seq_along(alpha)) {
+          alpha[j] <- alpha[j] * (errors[i - j])^2
+        }
+        
+        for (j in seq_along(beta)) {
+          beta[j] <- beta[j] * vars[i - j]
+        }
+        
+        for (j in seq_along(var_exog)) {
+          var_exog[j] <- var_exog[j] * X_var[i, j]
+        }
+        #if (length(var_exog) != ncol(X_var)) stop("Var exog dimension mismatch")
+        
+        level[i] <- sum(drift) + sum(ar) + sum(ma) + sum(level_exog)
+        errors[i] <- data[i] - level[i]
+        vars[i] <- omega + sum(alpha) + sum(beta) + sum(var_exog)
+        l[i] <- -1/2 * (log(2 * pi) + log(vars[i]) + ((errors[i]^2) / vars[i]))
+        #l[i] <- -(log(vars[i]) + ((errors[i]^2) / vars[i]))
+      }
+      
+      log_likelihood <- sum(l[-(1:warmup)])
+      
+      return(log_likelihood)
+    }
+  }
+ 
+  if (specs$density == "skewed-t") {
+    
+    params <- list(
+      drift = specs$drift,
+      ar = specs$start_ar,
+      ma = specs$start_ma,
+      level_exog = specs$start_level_exog,
+      omega = specs$omega,
+      alpha = specs$start_alpha,
+      beta = specs$start_beta,
+      var_exog = specs$start_var_exog,
+      df = specs$start_df,
+      skew = specs$start_skew
+    )
+    
+    idx <- sapply(params, length)
+    
+    params_vector <- as.numeric(unlist(params))
+    
+    unpack <- function(params) {
+      out <- list()
+      pos <- 1
+      for (name in names(idx)) {
+        len <- idx[name]
+        if (len == 0) {
+          out[[name]] <- numeric(0)
+        } else {
+          out[[name]] <- params[pos:(pos + len - 1)]
+        }
+        pos <- pos + len
+      }
+      return(out)
+    }
+    
+    reparametrization <- function(params) {
+      
+      params_re <- params
+      
+      params_re$ar <- tanh(params$ar)
+      params_re$ma <- tanh(params$ma)
+      
+      params_re$omega <- exp(params$omega)
+      
+      if (length(c(params$alpha, params$beta)) > 0) {
+        
+        tmp <- exp(c(params$alpha, params$beta))
+        tmp <- tmp / (1 + sum(tmp))
+        
+        k <- length(params$alpha)
+        
+        params_re$alpha <- tmp[seq_len(k)]
+        
+        if (length(params$beta) > 0) {
+          params_re$beta <- tmp[(k + 1):length(tmp)]
+        } else {
+          params_re$beta <- numeric(0)
+        }
+        
+      } else {
+        params_re$alpha <- numeric(0)
+        params_re$beta <- numeric(0)
+      }
+      
+      params_re$df <- 2 + exp(params$df)
+      
+      params_re$skew <- tanh(params$skew)
+      
+      return(params_re)
+    }
+    
+    log_likelihood <- function(params) {
+      
+      errors <- numeric(length(data))
+      vars <- numeric(length(data))
+      
+      if (sum(params$alpha) + sum(params$beta) >= 1) {
+        vars[1:warmup] <- var(data)
+      } else {
+        vars[1:warmup] <- params$omega /
+          (1 - sum(params$alpha) - sum(params$beta))
+      }
+      
+      l <- numeric(length(data))
+      
+      level <- numeric(length(data))
+      
+      for (i in seq_along(data)[-(1:warmup)]) {
+        
+        if (is.null(params$drift)) {
+          drift <- 0
+        } else {
+          drift <- params$drift
+        }
+        
+        ar <- params$ar
+        ma <- params$ma
+        level_exog <- params$level_exog
+        
+        omega <- params$omega
+        alpha <- params$alpha
+        beta <- params$beta
+        var_exog <- params$var_exog
+        
+        df <- params$df
+        skew <- params$skew
+        
+        for (j in seq_along(ar)) {
+          ar[j] <- ar[j] * data[i - j]
+        }
+        
+        for (j in seq_along(ma)) {
+          ma[j] <- ma[j] * errors[i - j]
+        }
+        
+        for (j in seq_along(level_exog)) {
+          level_exog[j] <- level_exog[j] * X_level[i, j]
+        }
+        
+        for (j in seq_along(alpha)) {
+          alpha[j] <- alpha[j] * (errors[i - j])^2
+        }
+        
+        for (j in seq_along(beta)) {
+          beta[j] <- beta[j] * vars[i - j]
+        }
+        
+        for (j in seq_along(var_exog)) {
+          var_exog[j] <- var_exog[j] * X_var[i, j]
+        }
+        
+        level[i] <- sum(drift) +
+          sum(ar) +
+          sum(ma) +
+          sum(level_exog)
+        
+        errors[i] <- data[i] - level[i]
+        
+        vars[i] <- omega +
+          sum(alpha) +
+          sum(beta) +
+          sum(var_exog)
+        
+        z <- errors[i] / sqrt(vars[i])
+        
+        c <- exp(lgamma((df + 1)/2) - lgamma(df/2) - 0.5 * log(pi * (df - 2)))
+        
+        a <- 4 * skew * c * ((df - 2)/(df - 1))
+        
+        b <- sqrt(1 + 3 * skew^2 - a^2)
+        
+        if (z < (-a / b)) {
+          s <- 1 - skew
+        } else {
+          s <- 1 + skew
+        }
+        
+        u <- (b * z + a) / s
+        
+        l[i] <- log(b) + log(c) - 0.5 * log(vars[i]) - ((df + 1)/2) * log(1 + (u^2)/(df - 2))
+      }
+      
+      log_likelihood <- sum(l[-(1:warmup)])
+      
+      return(log_likelihood)
+    }
+  }
+   
+
+  if (specs$method == "GD") {
+    
+    if (specs$gradient == "numeric") {
+      
+      gradient <- function(params_vector) {
+      
+      gradient <- params_vector
+      
+      for (i in seq_along(gradient)) {
+        
+        tmp_plus <- params_vector
+        tmp_plus[i] <- params_vector[i] + 1e-5
+        tmp_plus <- unpack(tmp_plus)
+        tmp_minus <- params_vector
+        tmp_minus[i] <- params_vector[i] - 1e-5
+        tmp_minus <- unpack(tmp_minus)
+        gradient[i] <- (log_likelihood(reparametrization(tmp_plus)) - log_likelihood(reparametrization(tmp_minus))) / (2 * 1e-5)
+      }
+      
+      return(gradient)
+    }
+    }
+    
+    if (specs$gradient == "analytic") {
+      
+      if (specs$density == "norm") {
+        gradient <- function(params_vector){
+        
+        params_raw <- unpack(params_vector)
+        params <- reparametrization(params_raw)
+        
+        drift <- if(length(params$drift)==0) 0 else params$drift
+        ar <- params$ar
+        ma <- params$ma
+        level_exog <- params$level_exog
+        
+        alpha <- params$alpha
+        beta <- params$beta
+        var_exog <- params$var_exog
+        
+        omega <- params$omega
+        
+        p <- length(ar)
+        q <- length(ma)
+        kx <- length(level_exog)
+        
+        r <- length(alpha)
+        s <- length(beta)
+        kz <- length(var_exog)
+        
+        T <- length(data)
+        k <- length(params_vector)
+        
+        errors <- numeric(T)
+        vars <- numeric(T)
+        
+        score <- numeric(k)
+        
+        #### derivative states
+        d_e <- numeric(k)
+        d_h <- numeric(k)
+        
+        if(sum(alpha)+sum(beta)>=1){
+          vars[1:warmup] <- var(data)
+        } else {
+          vars[1:warmup] <- omega/(1-sum(alpha)-sum(beta))
+        }
+        
+        for(t in seq_along(data)[-(1:warmup)]){
+          
+          #### mean
+          
+          mu <- drift
+          
+          if(p>0){
+            for(i in 1:p){
+              mu <- mu + ar[i]*data[t-i]
+            }
+          }
+          
+          if(q>0){
+            for(i in 1:q){
+              mu <- mu + ma[i]*errors[t-i]
+            }
+          }
+          
+          if(kx>0){
+            for(i in 1:kx){
+              mu <- mu + level_exog[i]*X_level[t,i]
+            }
+          }
+          
+          errors[t] <- data[t] - mu
+          
+          #### variance
+          
+          h <- omega
+          
+          if(r>0){
+            for(i in 1:r){
+              h <- h + alpha[i]*errors[t-i]^2
+            }
+          }
+          
+          if(s>0){
+            for(i in 1:s){
+              h <- h + beta[i]*vars[t-i]
+            }
+          }
+          
+          if(kz>0){
+            for(i in 1:kz){
+              h <- h + var_exog[i]*X_var[t,i]
+            }
+          }
+          
+          vars[t] <- h
+          
+          #### derivative recursion
+          
+          new_d_e <- numeric(k)
+          new_d_h <- numeric(k)
+          
+          idx <- 1
+          
+          #### drift
+          if(length(params_raw$drift)>0){
+            
+            new_d_e[idx] <- -1
+            
+            if(q>0){
+              for(j in 1:q){
+                new_d_e[idx] <- new_d_e[idx] - ma[j]*d_e[idx]
+              }
+            }
+            
+            idx <- idx+1
+          }
+          
+          #### AR
+          if(p>0){
+            for(i in 1:p){
+              
+              new_d_e[idx] <- -data[t-i]
+              
+              if(q>0){
+                for(j in 1:q){
+                  new_d_e[idx] <- new_d_e[idx] - ma[j]*d_e[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### MA
+          if(q>0){
+            for(i in 1:q){
+              
+              new_d_e[idx] <- -errors[t-i]
+              
+              if(q>0){
+                for(j in 1:q){
+                  new_d_e[idx] <- new_d_e[idx] - ma[j]*d_e[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### level exog
+          if(kx>0){
+            for(i in 1:kx){
+              
+              new_d_e[idx] <- -X_level[t,i]
+              
+              if(q>0){
+                for(j in 1:q){
+                  new_d_e[idx] <- new_d_e[idx] - ma[j]*d_e[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### omega
+          new_d_h[idx] <- 1
+          
+          if(s>0){
+            for(j in 1:s){
+              new_d_h[idx] <- new_d_h[idx] + beta[j]*d_h[idx]
+            }
+          }
+          
+          idx <- idx+1
+          
+          #### alpha
+          if(r>0){
+            for(i in 1:r){
+              
+              new_d_h[idx] <- errors[t-i]^2
+              
+              if(s>0){
+                for(j in 1:s){
+                  new_d_h[idx] <- new_d_h[idx] + beta[j]*d_h[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### beta
+          if(s>0){
+            for(i in 1:s){
+              
+              new_d_h[idx] <- vars[t-i]
+              
+              if(s>0){
+                for(j in 1:s){
+                  new_d_h[idx] <- new_d_h[idx] + beta[j]*d_h[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### variance exog
+          if(kz>0){
+            for(i in 1:kz){
+              
+              new_d_h[idx] <- X_var[t,i]
+              
+              if(s>0){
+                for(j in 1:s){
+                  new_d_h[idx] <- new_d_h[idx] + beta[j]*d_h[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### score update
+          
+          for(j in 1:k){
+            
+            score[j] <- score[j] +
+              (errors[t]/vars[t]) * (-new_d_e[j]) +
+              0.5*(errors[t]^2/vars[t]-1)/vars[t] * new_d_h[j]
+            
+          }
+          
+          d_e <- new_d_e
+          d_h <- new_d_h
+          
+        }
+        
+        #### chain rule
+        
+        idx <- 1
+        
+        if(length(params_raw$drift)>0){
+          idx <- idx+1
+        }
+        
+        if(p>0){
+          for(i in 1:p){
+            score[idx] <- score[idx]*(1 - tanh(params_raw$ar[i])^2)
+            idx <- idx+1
+          }
+        }
+        
+        if(q>0){
+          for(i in 1:q){
+            score[idx] <- score[idx]*(1 - tanh(params_raw$ma[i])^2)
+            idx <- idx+1
+          }
+        }
+        
+        idx <- idx + kx
+        
+        score[idx] <- score[idx]*exp(params_raw$omega)
+        idx <- idx+1
+        
+        if(r+s>0){
+          
+          tmp <- exp(c(params_raw$alpha, params_raw$beta))
+          S <- 1 + sum(tmp)
+          
+          soft <- tmp / S
+          
+          score_ab <- score[idx:(idx+r+s-1)]
+          
+          new_grad <- numeric(r+s)
+          
+          for(i in 1:(r+s)){
+            for(j in 1:(r+s)){
+              
+              if(i==j){
+                d <- soft[i]*(1-soft[j])
+              } else {
+                d <- -soft[i]*soft[j]
+              }
+              
+              new_grad[i] <- new_grad[i] + score_ab[j]*d
+              
+            }
+          }
+          
+          score[idx:(idx+r+s-1)] <- new_grad
+        }
+        
+        return(score)
+        
+      }
+      }
+      
+      if (specs$density == "t") {
+        gradient <- function(params_vector){
+        
+        params_raw <- unpack(params_vector)
+        params <- reparametrization(params_raw)
+        
+        drift <- if(length(params$drift)==0) 0 else params$drift
+        ar <- params$ar
+        ma <- params$ma
+        level_exog <- params$level_exog
+        
+        alpha <- params$alpha
+        beta <- params$beta
+        var_exog <- params$var_exog
+        
+        omega <- params$omega
+        df <- params$df
+        
+        p <- length(ar)
+        q <- length(ma)
+        kx <- length(level_exog)
+        
+        r <- length(alpha)
+        s <- length(beta)
+        kz <- length(var_exog)
+        
+        T <- length(data)
+        k <- length(params_vector)
+        
+        errors <- numeric(T)
+        vars <- numeric(T)
+        
+        score <- numeric(k)
+        
+        #### derivative states
+        d_e <- numeric(k)
+        d_h <- numeric(k)
+        
+        if(sum(alpha)+sum(beta)>=1){
+          vars[1:warmup] <- var(data)
+        } else {
+          vars[1:warmup] <- omega/(1-sum(alpha)-sum(beta))
+        }
+        
+        for(t in seq_along(data)[-(1:warmup)]){
+          
+          #### mean
+          
+          mu <- drift
+          
+          if(p>0){
+            for(i in 1:p){
+              mu <- mu + ar[i]*data[t-i]
+            }
+          }
+          
+          if(q>0){
+            for(i in 1:q){
+              mu <- mu + ma[i]*errors[t-i]
+            }
+          }
+          
+          if(kx>0){
+            for(i in 1:kx){
+              mu <- mu + level_exog[i]*X_level[t,i]
+            }
+          }
+          
+          errors[t] <- data[t] - mu
+          
+          #### variance
+          
+          h <- omega
+          
+          if(r>0){
+            for(i in 1:r){
+              h <- h + alpha[i]*errors[t-i]^2
+            }
+          }
+          
+          if(s>0){
+            for(i in 1:s){
+              h <- h + beta[i]*vars[t-i]
+            }
+          }
+          
+          if(kz>0){
+            for(i in 1:kz){
+              h <- h + var_exog[i]*X_var[t,i]
+            }
+          }
+          
+          vars[t] <- h
+          
+          #### derivative recursion
+          
+          new_d_e <- numeric(k)
+          new_d_h <- numeric(k)
+          
+          idx <- 1
+          
+          #### drift
+          if(length(params_raw$drift)>0){
+            
+            new_d_e[idx] <- -1
+            
+            if(q>0){
+              for(j in 1:q){
+                new_d_e[idx] <- new_d_e[idx] - ma[j]*d_e[idx]
+              }
+            }
+            
+            idx <- idx+1
+          }
+          
+          #### AR
+          if(p>0){
+            for(i in 1:p){
+              
+              new_d_e[idx] <- -data[t-i]
+              
+              if(q>0){
+                for(j in 1:q){
+                  new_d_e[idx] <- new_d_e[idx] - ma[j]*d_e[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### MA
+          if(q>0){
+            for(i in 1:q){
+              
+              new_d_e[idx] <- -errors[t-i]
+              
+              if(q>0){
+                for(j in 1:q){
+                  new_d_e[idx] <- new_d_e[idx] - ma[j]*d_e[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### level exog
+          if(kx>0){
+            for(i in 1:kx){
+              
+              new_d_e[idx] <- -X_level[t,i]
+              
+              if(q>0){
+                for(j in 1:q){
+                  new_d_e[idx] <- new_d_e[idx] - ma[j]*d_e[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### omega
+          new_d_h[idx] <- 1
+          
+          if(s>0){
+            for(j in 1:s){
+              new_d_h[idx] <- new_d_h[idx] + beta[j]*d_h[idx]
+            }
+          }
+          
+          idx <- idx+1
+          
+          #### alpha
+          if(r>0){
+            for(i in 1:r){
+              
+              new_d_h[idx] <- errors[t-i]^2
+              
+              if(s>0){
+                for(j in 1:s){
+                  new_d_h[idx] <- new_d_h[idx] + beta[j]*d_h[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### beta
+          if(s>0){
+            for(i in 1:s){
+              
+              new_d_h[idx] <- vars[t-i]
+              
+              if(s>0){
+                for(j in 1:s){
+                  new_d_h[idx] <- new_d_h[idx] + beta[j]*d_h[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### variance exog
+          if(kz>0){
+            for(i in 1:kz){
+              
+              new_d_h[idx] <- X_var[t,i]
+              
+              if(s>0){
+                for(j in 1:s){
+                  new_d_h[idx] <- new_d_h[idx] + beta[j]*d_h[idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### Student-t score weights
+          
+          z2 <- errors[t]^2 / vars[t]
+          
+          w1 <- (df + 1)/(df - 2 + z2)
+          
+          w2 <- 0.5*((df + 1)*z2/(df - 2 + z2) - 1)
+          
+          #### score update
+          
+          for(j in 1:k){
+            
+            score[j] <- score[j] +
+              w1*(errors[t]/vars[t])*(-new_d_e[j]) +
+              (w2/vars[t])*new_d_h[j]
+            
+          }
+          
+          #### df derivative
+          
+          term1 <- 0.5*(digamma((df+1)/2) - digamma(df/2))
+          term2 <- -1/(2*(df-2))
+          term3 <- -0.5*log(1 + z2/(df-2))
+          term4 <- (df+1)*z2/(2*(df-2)*(df-2+z2))
+          
+          score[k] <- score[k] + term1 + term2 + term3 + term4
+          
+          d_e <- new_d_e
+          d_h <- new_d_h
+          
+        }
+        
+        #### chain rule
+        
+        idx <- 1
+        
+        if(length(params_raw$drift)>0){
+          idx <- idx+1
+        }
+        
+        if(p>0){
+          for(i in 1:p){
+            score[idx] <- score[idx]*(1 - tanh(params_raw$ar[i])^2)
+            idx <- idx+1
+          }
+        }
+        
+        if(q>0){
+          for(i in 1:q){
+            score[idx] <- score[idx]*(1 - tanh(params_raw$ma[i])^2)
+            idx <- idx+1
+          }
+        }
+        
+        idx <- idx + kx
+        
+        score[idx] <- score[idx]*exp(params_raw$omega)
+        idx <- idx+1
+        
+        if(r+s>0){
+          
+          tmp <- exp(c(params_raw$alpha, params_raw$beta))
+          S <- 1 + sum(tmp)
+          
+          soft <- tmp / S
+          
+          score_ab <- score[idx:(idx+r+s-1)]
+          
+          new_grad <- numeric(r+s)
+          
+          for(i in 1:(r+s)){
+            for(j in 1:(r+s)){
+              
+              if(i==j){
+                d <- soft[i]*(1-soft[j])
+              } else {
+                d <- -soft[i]*soft[j]
+              }
+              
+              new_grad[i] <- new_grad[i] + score_ab[j]*d
+              
+            }
+          }
+          
+          score[idx:(idx+r+s-1)] <- new_grad
+        }
+        
+        #### df chain rule
+        
+        score[k] <- score[k]*exp(params_raw$df)
+        
+        return(score)
+        
+      }
+      }
+      
+      
+    }
+    
+    likelihood_history <- numeric(specs$iterations)
+    
+    params_old <- params_vector
+    params_lookahead <- params_vector
+    v <- numeric(length(params_vector))
+    v_old <- v
+    learning_rate <- rep(specs$learning_rate, length(params_vector))
+    inert <- specs$inert
+    eta_plus <- specs$eta_plus
+    eta_minus <- specs$eta_minus
+    gradient_old <- gradient(params_vector)
+    
+    for (iter in 1:specs$iterations) {
+      
+      params_lookahead <- params_old + inert * v_old
+      gradient_new <- gradient(params_lookahead)
+      v <- inert * v_old + learning_rate * gradient_new
+      params_new <- params_old + v
+      sign <- sign(gradient_old) == sign(gradient_new)
+      sign[!is.finite(sign)] <- FALSE
+      learning_rate[sign] <- pmin((learning_rate[sign] * eta_plus), 1)
+      learning_rate[!sign] <- pmin((learning_rate[!sign] * eta_minus), 1)
+      gradient_old <- gradient_new
+      v_old <- v
+      
+      if(any(!is.finite(params_new))) {
+        cat("параметры улетели\n")
+        break
+      }
+      
+      if(all(abs(params_old - params_new) < specs$convergence, na.rm = TRUE)) {
+        cat("сходимость достигнута на итерации ", iter, "\n")
+        params_old <- params_new
+        break
+      }
+      
+      params_old <- params_new
+      likelihood_history[iter] <- log_likelihood(reparametrization(unpack(params_old)))
+      #cat(log_likelihood(split(params_new, rep(names(idx), idx))), "\n")
+      cat(params_new, "\n")
+    }
+    
+    estimated_params <- unpack(params_old)
+    estimated_params <- reparametrization(estimated_params)
+    
+    score_matrix <- function(params_vector){
+      
+      params_raw <- unpack(params_vector)
+      params <- reparametrization(params_raw)
+      
+      drift <- if(length(params$drift)==0) 0 else params$drift
+      ar <- params$ar
+      ma <- params$ma
+      alpha <- params$alpha
+      beta <- params$beta
+      omega <- params$omega
+      
+      p <- length(ar)
+      q <- length(ma)
+      r <- length(alpha)
+      s <- length(beta)
+      
+      T <- length(data)
+      k <- length(params_vector)
+      
+      errors <- numeric(T)
+      vars <- numeric(T)
+      
+      score_t <- matrix(0,T,k)
+      
+      d_e <- matrix(0,T,k)
+      d_h <- matrix(0,T,k)
+      
+      if(sum(alpha)+sum(beta)>=1){
+        vars[1:warmup] <- var(data)
+      } else {
+        vars[1:warmup] <- omega/(1-sum(alpha)-sum(beta))
+      }
+      
+      for(t in seq_along(data)[-(1:warmup)]){
+        
+        mu <- drift
+        
+        if(p>0){
+          for(i in 1:p){
+            mu <- mu + ar[i]*data[t-i]
+          }
+        }
+        
+        if(q>0){
+          for(i in 1:q){
+            mu <- mu + ma[i]*errors[t-i]
+          }
+        }
+        
+        errors[t] <- data[t]-mu
+        
+        h <- omega
+        
+        if(r>0){
+          for(i in 1:r){
+            h <- h + alpha[i]*errors[t-i]^2
+          }
+        }
+        
+        if(s>0){
+          for(i in 1:s){
+            h <- h + beta[i]*vars[t-i]
+          }
+        }
+        
+        vars[t] <- h
+        
+        idx <- 1
+        
+        if(length(params_raw$drift)>0){
+          
+          d_e[t,idx] <- -1
+          
+          if(q>0){
+            for(j in 1:q){
+              d_e[t,idx] <- d_e[t,idx] - ma[j]*d_e[t-j,idx]
+            }
+          }
+          
+          idx <- idx+1
+        }
+        
+        if(p>0){
+          for(i in 1:p){
+            
+            d_e[t,idx] <- -data[t-i]
+            
+            if(q>0){
+              for(j in 1:q){
+                d_e[t,idx] <- d_e[t,idx] - ma[j]*d_e[t-j,idx]
+              }
+            }
+            
+            idx <- idx+1
+          }
+        }
+        
+        if(q>0){
+          for(i in 1:q){
+            
+            d_e[t,idx] <- -errors[t-i]
+            
+            if(q>0){
+              for(j in 1:q){
+                d_e[t,idx] <- d_e[t,idx] - ma[j]*d_e[t-j,idx]
+              }
+            }
+            
+            idx <- idx+1
+          }
+        }
+        
+        idx_var <- idx
+        
+        d_h[t,idx_var] <- 1
+        
+        if(s>0){
+          for(j in 1:s){
+            d_h[t,idx_var] <- d_h[t,idx_var] + beta[j]*d_h[t-j,idx_var]
+          }
+        }
+        
+        idx_var <- idx_var+1
+        
+        if(r>0){
+          for(i in 1:r){
+            
+            d_h[t,idx_var] <- errors[t-i]^2 +
+              alpha[i]*2*errors[t-i]*d_e[t-i,idx_var]
+            
+            if(s>0){
+              for(j in 1:s){
+                d_h[t,idx_var] <- d_h[t,idx_var] +
+                  beta[j]*d_h[t-j,idx_var]
+              }
+            }
+            
+            idx_var <- idx_var+1
+          }
+        }
+        
+        if(s>0){
+          for(i in 1:s){
+            
+            d_h[t,idx_var] <- vars[t-i]
+            
+            if(s>0){
+              for(j in 1:s){
+                d_h[t,idx_var] <- d_h[t,idx_var] +
+                  beta[j]*d_h[t-j,idx_var]
+              }
+            }
+            
+            idx_var <- idx_var+1
+          }
+        }
+        
+        for(j in 1:k){
+          
+          score_t[t,j] <-
+            (errors[t]/vars[t]) * (-d_e[t,j]) +
+            0.5*(errors[t]^2/vars[t]-1)/vars[t] * d_h[t,j]
+          
+        }
+        
+      }
+      
+      return(score_t)
+    }
+    
+    hessian_opg <- function(params_vector){
+      
+      S <- score_matrix(params_vector)
+      
+      H <- t(S) %*% S
+      
+      return(H)
+      
+    }
+    
+    hessian <- hessian_opg(params_vector)
+  }
+  
+  if (specs$method == "SPSA") {
+    
+    gradient <- function(params_vector, eps) {
+      
+      gradient <- params_vector
+      v <- sample(c(-1, 1), length(params_vector), replace = TRUE)
+      L_plus <- log_likelihood(reparametrization(unpack(params_vector + eps * v)))
+      L_minus <- log_likelihood(reparametrization(unpack(params_vector - eps * v)))
+      
+      gradient <- ((L_plus - L_minus) / (2 * eps)) * v * length(params_vector)
+      
+      return(gradient)
+    }
+    
+    likelihood_history <- numeric(specs$iterations)
+    tmp <- matrix(nrow = 1, ncol = length(params_vector))
+    tmp[1, ] <- params_vector
+    
+    params_old <- params_vector
+    c <- specs$eps
+    learning_rate <- specs$learning_rate
+    
+    for (iter in 1:specs$iterations) {
+      
+      eps <- c / (iter^(0.166))
+      learning_rate <- specs$learning_rate / ((iter + 0.1 * specs$iterations)^(0.602))
+      params_new <- params_old + learning_rate * gradient(params_old, eps)
+      
+      if(any(!is.finite(params_new))) {
+        cat("параметры улетели\n")
+        break
+      }
+      
+      if(all(abs(params_old - params_new) < specs$convergence, na.rm = TRUE)) {
+        cat("сходимость достигнута на итерации ", iter, "\n")
+        params_old <- params_new
+        break
+      }
+      
+      params_old <- params_new
+      tmp <- rbind(tmp, params_old)
+      likelihood_history[iter] <- log_likelihood(reparametrization(unpack(params_old)))
+      #cat(log_likelihood(split(params_new, rep(names(idx), idx))), "\n")
+      cat(params_old, "\n")
+    }
+    
+    params_old <- colMeans(tmp[((nrow(tmp) - specs$mean_last + 1):nrow(tmp)), ])
+    
+    estimated_params <- unpack(params_old)
+    estimated_params <- reparametrization(estimated_params)
+    
+    hessian <- function(params_vector) {
+      
+      H <- matrix(nrow = length(params_vector), ncol = length(params_vector))
+      
+      for (i in seq_along(params_vector)) {
+        
+        for (j in seq_along(params_vector)) {
+          
+          if (i == j) {
+            tmp <- params_vector
+            tmp <- unpack(tmp)
+            tmp_plus <- params_vector
+            tmp_minus <- params_vector
+            tmp_plus[i] <- tmp_plus[i] + 1e-4
+            tmp_plus <- unpack(tmp_plus)
+            tmp_minus[i] <- tmp_minus[i] - 1e-4
+            tmp_minus <- unpack(tmp_minus)
+            H[i, j] <- (log_likelihood(reparametrization(tmp_plus))  - 2 * log_likelihood(reparametrization(tmp))  + log_likelihood(reparametrization(tmp_minus))) / ((1e-4)^2)
+          }
+          
+          if (i != j) {
+            tmp_plus_plus <- params_vector
+            tmp_plus_plus[i] <- tmp_plus_plus[i] + 1e-4
+            tmp_plus_plus[j] <- tmp_plus_plus[j] + 1e-4
+            tmp_plus_plus <- unpack(tmp_plus_plus)
+            tmp_plus_minus <- params_vector
+            tmp_plus_minus[i] <- tmp_plus_minus[i] + 1e-4
+            tmp_plus_minus[j] <- tmp_plus_minus[j] - 1e-4
+            tmp_plus_minus <- unpack(tmp_plus_minus)
+            tmp_minus_plus <- params_vector
+            tmp_minus_plus[i] <- tmp_minus_plus[i] - 1e-4
+            tmp_minus_plus[j] <- tmp_minus_plus[j] + 1e-4
+            tmp_minus_plus <- unpack(tmp_minus_plus)
+            tmp_minus_minus <- params_vector
+            tmp_minus_minus[i] <- tmp_minus_minus[i] - 1e-4
+            tmp_minus_minus[j] <- tmp_minus_minus[j] - 1e-4
+            tmp_minus_minus <- unpack(tmp_minus_minus)
+            H[i, j] <- (log_likelihood(reparametrization(tmp_plus_plus)) - log_likelihood(reparametrization(tmp_plus_minus)) - log_likelihood(reparametrization(tmp_minus_plus)) 
+                        + log_likelihood(reparametrization(tmp_minus_minus))) / (4 * (1e-4)^2)
+          }
+        }
+      }
+      
+      return(H)
+    }
+    
+    hessian <- hessian(params_old)
+    
+  }
+  
+  if (specs$method == "BFGS") {
+    
+    if (specs$gradient == "numeric") {
+      gradient <- function(params_vector) {
+        
+        gradient <- params_vector
+        
+        for (i in seq_along(gradient)) {
+          
+          tmp_plus <- params_vector
+          tmp_plus[i] <- params_vector[i] + 1e-4
+          tmp_plus <- unpack(tmp_plus)
+          tmp_minus <- params_vector
+          tmp_minus[i] <- params_vector[i] - 1e-4
+          tmp_minus <- unpack(tmp_minus)
+          gradient[i] <- (log_likelihood(reparametrization(tmp_plus)) - log_likelihood(reparametrization(tmp_minus))) / (2 * 1e-4)
+        }
+        
+        return(gradient)
+      }
+    }
+    
+    if (specs$gradient == "analytic") {
+      gradient <- function(params_vector){
+        
+        params_raw <- unpack(params_vector)
+        params <- reparametrization(params_raw)
+        
+        drift <- if(length(params$drift)==0) 0 else params$drift
+        ar <- params$ar
+        ma <- params$ma
+        alpha <- params$alpha
+        beta <- params$beta
+        omega <- params$omega
+        
+        p <- length(ar)
+        q <- length(ma)
+        r <- length(alpha)
+        s <- length(beta)
+        
+        T <- length(data)
+        k <- length(params_vector)
+        
+        errors <- numeric(T)
+        vars <- numeric(T)
+        
+        d_e <- matrix(0,T,k)
+        d_h <- matrix(0,T,k)
+        
+        if(sum(alpha)+sum(beta)>=1){
+          vars[1:warmup] <- var(data)
+        } else {
+          vars[1:warmup] <- omega/(1-sum(alpha)-sum(beta))
+        }
+        
+        score <- numeric(k)
+        
+        for(t in seq_along(data)[-(1:warmup)]){
+          
+          #### mean ####
+          
+          mu <- drift
+          
+          if(p>0){
+            for(i in 1:p){
+              mu <- mu + ar[i]*data[t-i]
+            }
+          }
+          
+          if(q>0){
+            for(i in 1:q){
+              mu <- mu + ma[i]*errors[t-i]
+            }
+          }
+          
+          errors[t] <- data[t] - mu
+          
+          #### variance ####
+          
+          h <- omega
+          
+          if(r>0){
+            for(i in 1:r){
+              h <- h + alpha[i]*errors[t-i]^2
+            }
+          }
+          
+          if(s>0){
+            for(i in 1:s){
+              h <- h + beta[i]*vars[t-i]
+            }
+          }
+          
+          vars[t] <- h
+          
+          #### derivatives ε ####
+          
+          idx <- 1
+          
+          if(length(params_raw$drift)>0){
+            
+            d_e[t,idx] <- -1
+            
+            if(q>0){
+              for(j in 1:q){
+                d_e[t,idx] <- d_e[t,idx] - ma[j]*d_e[t-j,idx]
+              }
+            }
+            
+            idx <- idx+1
+          }
+          
+          if(p>0){
+            for(i in 1:p){
+              
+              d_e[t,idx] <- -data[t-i]
+              
+              if(q>0){
+                for(j in 1:q){
+                  d_e[t,idx] <- d_e[t,idx] - ma[j]*d_e[t-j,idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          if(q>0){
+            for(i in 1:q){
+              
+              d_e[t,idx] <- -errors[t-i]
+              
+              if(q>0){
+                for(j in 1:q){
+                  d_e[t,idx] <- d_e[t,idx] - ma[j]*d_e[t-j,idx]
+                }
+              }
+              
+              idx <- idx+1
+            }
+          }
+          
+          #### derivatives h ####
+          
+          idx_var <- idx
+          
+          d_h[t,idx_var] <- 1
+          
+          if(s>0){
+            for(j in 1:s){
+              d_h[t,idx_var] <- d_h[t,idx_var] + beta[j]*d_h[t-j,idx_var]
+            }
+          }
+          
+          idx_var <- idx_var+1
+          
+          if(r>0){
+            for(i in 1:r){
+              
+              d_h[t,idx_var] <- errors[t-i]^2 +
+                alpha[i]*2*errors[t-i]*d_e[t-i,idx_var]
+              
+              if(s>0){
+                for(j in 1:s){
+                  d_h[t,idx_var] <- d_h[t,idx_var] +
+                    beta[j]*d_h[t-j,idx_var]
+                }
+              }
+              
+              idx_var <- idx_var+1
+            }
+          }
+          
+          if(s>0){
+            for(i in 1:s){
+              
+              d_h[t,idx_var] <- vars[t-i]
+              
+              if(s>0){
+                for(j in 1:s){
+                  d_h[t,idx_var] <- d_h[t,idx_var] +
+                    beta[j]*d_h[t-j,idx_var]
+                }
+              }
+              
+              idx_var <- idx_var+1
+            }
+          }
+          
+          #### score ####
+          
+          for(j in 1:k){
+            
+            score[j] <- score[j] +
+              (errors[t]/vars[t]) * (-d_e[t,j]) +
+              0.5*(errors[t]^2/vars[t]-1)/vars[t] * d_h[t,j]
+            
+          }
+          
+        }
+        
+        #### chain rule ####
+        
+        idx <- 1
+        
+        if(length(params_raw$drift)>0){
+          idx <- idx+1
+        }
+        
+        #### AR tanh ####
+        
+        if(p>0){
+          for(i in 1:p){
+            score[idx] <- score[idx]*(1 - tanh(params_raw$ar[i])^2)
+            idx <- idx+1
+          }
+        }
+        
+        #### MA tanh ####
+        
+        if(q>0){
+          for(i in 1:q){
+            score[idx] <- score[idx]*(1 - tanh(params_raw$ma[i])^2)
+            idx <- idx+1
+          }
+        }
+        
+        #### omega exp ####
+        
+        score[idx] <- score[idx]*exp(params_raw$omega)
+        idx <- idx+1
+        
+        #### softmax for alpha beta ####
+        
+        if(r+s>0){
+          
+          tmp <- exp(c(params_raw$alpha, params_raw$beta))
+          S <- 1 + sum(tmp)
+          
+          soft <- tmp / S
+          
+          score_ab <- score[idx:(idx+r+s-1)]
+          
+          new_grad <- numeric(r+s)
+          
+          for(i in 1:(r+s)){
+            for(j in 1:(r+s)){
+              
+              if(i==j){
+                d <- soft[i]*(1-soft[j])
+              } else {
+                d <- -soft[i]*soft[j]
+              }
+              
+              new_grad[i] <- new_grad[i] + score_ab[j]*d
+              
+            }
+          }
+          
+          score[idx:(idx+r+s-1)] <- new_grad
+        }
+        
+        return(score)
+      }
+    }
+    
+    likelihood_history <- numeric(specs$iterations)
+    
+    BFGS_B <- function(B, rho, s, y) {
+      
+      B_new <- (diag(length(s)) - as.numeric(rho) * s %*% t(y)) %*% B %*% (diag(length(s)) - as.numeric(rho) * y %*% t(s)) + as.numeric(rho) * s %*% t(s)
+      
+      return(B_new)
+    }
+    
+    params_old <- params_vector
+    B <- diag(length(params_vector))
+    
+    for (iter in 1:specs$iterations) {
+      learning_rate <- 1
+      grad <- as.matrix(gradient(params_old))
+      p <- B %*% grad
+      
+      if (as.numeric(t(grad) %*% p) <= 0) {
+        cat("not ascent direction\n")
+        p <- grad   # fallback на градиент
+      }
+    
+      tmp1 <- reparametrization(unpack(params_old + learning_rate * p))
+      tmp2 <- reparametrization(unpack(params_old))
+      while (log_likelihood(tmp1) < (log_likelihood(tmp2) + (1e-4 * learning_rate * t(grad) %*% p))) {
+      learning_rate <- learning_rate * 0.5
+      tmp1 <- reparametrization(unpack(as.vector(params_old + learning_rate * p)))
+      if (learning_rate < 1e-8) {
+        cat("learning rate рванул\n")
+        break
+      }
+    }
+    
+      params_new <- params_old + learning_rate * p
+      
+      s <- params_new - params_old
+      y <- gradient(params_new) - grad
+      rho <- as.numeric(1 / (t(y) %*% s))
+      
+      #if (as.numeric(t(y) %*% s) <= 1e-10) {
+      #  cat("пропущена итерация", iter, "\n")
+      #} else {
+      #  
+      #}
+      
+      rho <- 1 / (t(y) %*% s)
+      B <- BFGS_B(B, rho, s, y)
+      B <- 0.5 * (B + t(B))
+      
+      if(any(!is.finite(params_new))) {
+        cat("параметры улетели\n")
+        break
+      }
+      
+      if(all(abs(params_old - params_new) < specs$convergence, na.rm = TRUE)) {
+        cat("сходимость достигнута на итерации ", iter, "\n")
+        params_old <- params_new
+        break
+      }
+      
+      params_old <- params_new
+      likelihood_history[iter] <- log_likelihood(reparametrization(unpack(params_old)))
+      cat(params_new, "\n")
+    }
+    
+    estimated_params <- unpack(params_old)
+    estimated_params <- reparametrization(estimated_params)
+    
+    hessian <- function(params_vector) {
+      
+      H <- matrix(nrow = length(params_vector), ncol = length(params_vector))
+      
+      for (i in seq_along(params_vector)) {
+        
+        for (j in seq_along(params_vector)) {
+          
+          if (i == j) {
+            tmp <- params_vector
+            tmp <- unpack(tmp)
+            tmp_plus <- params_vector
+            tmp_minus <- params_vector
+            tmp_plus[i] <- tmp_plus[i] + 1e-4
+            tmp_plus <- unpack(tmp_plus)
+            tmp_minus[i] <- tmp_minus[i] - 1e-4
+            tmp_minus <- unpack(tmp_minus)
+            H[i, j] <- (log_likelihood(reparametrization(tmp_plus))  - 2 * log_likelihood(reparametrization(tmp))  + log_likelihood(reparametrization(tmp_minus))) / ((1e-4)^2)
+          }
+          
+          if (i != j) {
+            tmp_plus_plus <- params_vector
+            tmp_plus_plus[i] <- tmp_plus_plus[i] + 1e-4
+            tmp_plus_plus[j] <- tmp_plus_plus[j] + 1e-4
+            tmp_plus_plus <- unpack(tmp_plus_plus)
+            tmp_plus_minus <- params_vector
+            tmp_plus_minus[i] <- tmp_plus_minus[i] + 1e-4
+            tmp_plus_minus[j] <- tmp_plus_minus[j] - 1e-4
+            tmp_plus_minus <- unpack(tmp_plus_minus)
+            tmp_minus_plus <- params_vector
+            tmp_minus_plus[i] <- tmp_minus_plus[i] - 1e-4
+            tmp_minus_plus[j] <- tmp_minus_plus[j] + 1e-4
+            tmp_minus_plus <- unpack(tmp_minus_plus)
+            tmp_minus_minus <- params_vector
+            tmp_minus_minus[i] <- tmp_minus_minus[i] - 1e-4
+            tmp_minus_minus[j] <- tmp_minus_minus[j] - 1e-4
+            tmp_minus_minus <- unpack(tmp_minus_minus)
+            H[i, j] <- (log_likelihood(reparametrization(tmp_plus_plus)) - log_likelihood(reparametrization(tmp_plus_minus)) - log_likelihood(reparametrization(tmp_minus_plus)) 
+                        + log_likelihood(reparametrization(tmp_minus_minus))) / (4 * (1e-4)^2)
+          }
+        }
+      }
+      
+      return(H)
+    }
+    
+    hessian <- hessian(params_old)
+  }
+  
+  return(list(estimated_params = estimated_params, hessian = hessian, likelihood_history = likelihood_history))
+}
